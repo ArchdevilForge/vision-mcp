@@ -131,7 +131,7 @@ fn call_vision(args: &Value) -> String {
     };
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("describe");
     let user_prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-    let max_tokens = args.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(4096);
+    let max_tokens = args.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(4096).max(1);
 
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -143,13 +143,13 @@ fn call_vision(args: &Value) -> String {
     let mut region_info: Option<(u32, u32, u32)> = None; // (x1, y1, scale)
     let region_note = match parse_region(args) {
         Some((x1, y1, x2, y2)) => match crop_upscale(&payload, x1, y1, x2, y2) {
-            Some((img, scale)) => {
+            Ok((img, scale)) => {
                 mime = "image/png";
                 payload = img;
                 region_info = Some((x1, y1, scale));
                 format!("当前是原图区域 {x1},{y1}-{x2},{y2} 裁剪后放大 {scale}x 的视图（输出坐标使用当前视图坐标，服务端会自动换算回原图）。")
             }
-            None => return err_msg("cannot decode image for region crop"),
+            Err(e) => return err_msg(&e),
         },
         None => String::new(),
     };
@@ -171,9 +171,6 @@ fn call_vision(args: &Value) -> String {
         _ if user_prompt.is_empty() => format!("{size_note}{DEFAULT_PROMPT}"),
         _ => format!("{size_note}用户关注点：{user_prompt}\n直接回答，尽量具体；涉及位置时用原图像素坐标 (x1,y1,x2,y2)。"),
     };
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
-    let data_url = format!("data:{mime};base64,{b64}");
 
     match send_vision(&payload, &mime, &prompt, max_tokens) {
         Ok(s) => {
@@ -279,13 +276,13 @@ fn convert_bboxes(json: &str, region: Option<(u32, u32, u32)>) -> String {
         for item in arr.iter_mut() {
             if let Some(obj) = item.as_object_mut() {
                 for key in ["x1", "x2"] {
-                    if let Some(n) = obj.get(key).and_then(|n| n.as_i64()) {
-                        obj.insert(key.to_string(), json!(x1 as i64 + n / scale as i64));
+                    if let Some(n) = obj.get(key).and_then(|n| n.as_f64()) {
+                        obj.insert(key.to_string(), json!((x1 as f64 + n / scale as f64).round() as i64));
                     }
                 }
                 for key in ["y1", "y2"] {
-                    if let Some(n) = obj.get(key).and_then(|n| n.as_i64()) {
-                        obj.insert(key.to_string(), json!(y1 as i64 + n / scale as i64));
+                    if let Some(n) = obj.get(key).and_then(|n| n.as_f64()) {
+                        obj.insert(key.to_string(), json!((y1 as f64 + n / scale as f64).round() as i64));
                     }
                 }
             }
@@ -307,12 +304,15 @@ fn parse_region(args: &Value) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// 裁剪 region 并整数倍放大（最短边到 ≥512，上限 4x），返回编码后的 PNG + 放大倍数。
-fn crop_upscale(data: &[u8], x1: u32, y1: u32, x2: u32, y2: u32) -> Option<(Vec<u8>, u32)> {
-    let img = image::load_from_memory(data).ok()?;
+fn crop_upscale(data: &[u8], x1: u32, y1: u32, x2: u32, y2: u32) -> Result<(Vec<u8>, u32), String> {
+    let img = image::load_from_memory(data).map_err(|_| "cannot decode image for region crop")?;
     let (w, h) = (img.width(), img.height());
+    if x1 >= w || y1 >= h {
+        return Err(format!("region out of bounds (image is {w}x{h})"));
+    }
     let (x1, y1, x2, y2) = (x1.min(w), y1.min(h), x2.min(w), y2.min(h));
     if x2 <= x1 || y2 <= y1 {
-        return None;
+        return Err("invalid region (x2<=x1 or y2<=y1)".into());
     }
     let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
     let (cw, ch) = (crop.width(), crop.height());
@@ -323,8 +323,10 @@ fn crop_upscale(data: &[u8], x1: u32, y1: u32, x2: u32, y2: u32) -> Option<(Vec<
         crop.to_rgba8()
     };
     let mut out = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(resized).write_to(&mut out, image::ImageFormat::Png).ok()?;
-    Some((out.into_inner(), scale))
+    image::DynamicImage::ImageRgba8(resized)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|_| "cannot encode cropped image")?;
+    Ok((out.into_inner(), scale))
 }
 
 /// 本地确定性工具：格式/尺寸/主色（top5 hex+占比），零 token。
@@ -469,7 +471,7 @@ fn ocr_image(args: &Value) -> String {
         Some(p) => p,
         None => return err_msg("missing required argument: image"),
     };
-    let max_tokens = args.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(2048);
+    let max_tokens = args.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(2048).max(1);
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => return err_msg(&format!("cannot read {path}: {e}")),
@@ -544,6 +546,15 @@ fn trace_svg(args: &Value) -> String {
         }
     }
     thin_zs(&mut bin, w, h);
+    // 实心块 guard：细化后前景仍占比过高 → 不是线稿，拒绝（避免蛇形巨型 path）
+    let mut fg = 0usize;
+    for row in bin.iter() {
+        fg += row.iter().filter(|&&v| v).count();
+    }
+    let fg_ratio = fg as f64 * 100.0 / (w * h) as f64;
+    if fg_ratio > 45.0 {
+        return err_msg(&format!("input looks like a solid fill ({fg_ratio:.0}% foreground after thinning), not line art — trace needs flat high-contrast strokes"));
+    }
     let paths = trace_paths(&bin, w, h);
     let mut d = String::new();
     for p in &paths {
@@ -877,10 +888,22 @@ mod tests {
         let out = convert_bboxes(j, Some((40, 20, 4)));
         assert_eq!(
             serde_json::from_str::<Value>(&out).unwrap(),
-            serde_json::from_str::<Value>(r#"[{"label":"输入框","x1":40,"y1":37,"x2":65,"y2":45}]"#).unwrap()
+            serde_json::from_str::<Value>(r#"[{"label":"输入框","x1":40,"y1":38,"x2":65,"y2":45}]"#).unwrap()
         );
         // 无 region：原样
         assert_eq!(convert_bboxes(j, None), j);
+    }
+
+    #[test]
+    fn convert_bboxes_handles_float_coords() {
+        let j = r#"[{"label":"btn","x1":100.0,"y1":1067.5,"x2":200.5,"y2":300}]"#;
+        let out = convert_bboxes(j, Some((10, 5, 4)));
+        let v = serde_json::from_str::<Value>(&out).unwrap();
+        // 10 + 100/4 = 35; 5 + 1067.5/4 = 271.875 → 272; 10 + 200.5/4 = 60; 5 + 300/4 = 80
+        assert_eq!(v[0]["x1"], json!(35));
+        assert_eq!(v[0]["y1"], json!(272));
+        assert_eq!(v[0]["x2"], json!(60));
+        assert_eq!(v[0]["y2"], json!(80));
     }
 
     #[test]
@@ -892,6 +915,17 @@ mod tests {
         let (out, scale) = crop_upscale(&buf.into_inner(), 0, 0, 50, 50).unwrap();
         assert_eq!(scale, 4); // 512/50 → cap 4
         assert_eq!(image_dims(&out), Some((200, 200)));
+    }
+
+    #[test]
+    fn crop_upscale_rejects_out_of_bounds() {
+        let mut img = image::RgbaImage::new(100, 100);
+        fill_red(&mut img);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let bytes = buf.into_inner();
+        assert!(crop_upscale(&bytes, 5000, 5000, 6000, 6000).is_err());
+        assert!(crop_upscale(&bytes, 10, 10, 5, 20).is_err()); // x2 <= x1
     }
 
     #[test]
@@ -990,6 +1024,23 @@ mod tests {
         assert!(out.starts_with("<svg"), "{out}");
         assert!(out.contains("<path d=\"M"), "{out}");
         assert!(out.contains("viewBox=\"0 0 20 20\""), "{out}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn trace_svg_rejects_solid_fill() {
+        let mut img = image::RgbaImage::new(40, 40);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([0u8, 0, 0, 255]); // 全黑实心
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let dir = std::env::temp_dir();
+        let p = dir.join("vsolid.png");
+        std::fs::write(&p, buf.into_inner()).unwrap();
+        let out = trace_svg(&json!({"image": p.to_str().unwrap()}));
+        assert!(out.contains("solid fill"), "{out}");
+        assert!(!out.contains("<svg"), "{out}");
         let _ = std::fs::remove_file(&p);
     }
 }
