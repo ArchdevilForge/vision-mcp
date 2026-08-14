@@ -74,15 +74,26 @@ fn main() {
                         "required": ["image"]
                     }
                 },{
-                    "name": "pixel_diff",
-                    "description": "Compare two images pixel-by-pixel locally (NO model call, NO tokens). Returns total diff ratio and a grid of differing regions with pixel ranges. Ideal for UI verification / screenshot comparison.",
+                    "name": "ocr_image",
+                    "description": "OCR a (possibly very tall) screenshot locally by chunking: tall images are split into overlapping blocks, each transcribed by the vision model, results merged with block markers. Use for long screenshots / chat logs / scroll captures.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "image1": { "type": "string", "description": "Path to first image" },
-                            "image2": { "type": "string", "description": "Path to second image" }
+                            "image": { "type": "string", "description": "Path to the image file" },
+                            "maxTokens": { "type": "integer", "description": "Max output tokens per block; default 2048" }
                         },
-                        "required": ["image1", "image2"]
+                        "required": ["image"]
+                    }
+                },{
+                    "name": "trace_svg",
+                    "description": "Locally vectorize a flat high-contrast graphic (icon/logo/line art) into black-on-transparent SVG paths: grayscale + threshold + Zhang-Suen center-line thinning + polyline tracing. NO model call, zero tokens, deterministic. Returns SVG markup — write it to a file. Use image_stats first to confirm the source is flat and high-contrast.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "image": { "type": "string", "description": "Path to the image file" },
+                            "threshold": { "type": "integer", "description": "Grayscale cutoff (0-255); default 128" }
+                        },
+                        "required": ["image"]
                     }
                 }]
             })),
@@ -94,6 +105,8 @@ fn main() {
                     "analyze_image" => call_vision(&args),
                     "image_stats" => image_stats(&args),
                     "pixel_diff" => pixel_diff(&args),
+                    "ocr_image" => ocr_image(&args),
+                    "trace_svg" => trace_svg(&args),
                     other => format!("ERROR: unknown tool: {other}"),
                 };
                 Some(json!({ "content": [{ "type": "text", "text": result }] }))
@@ -162,11 +175,26 @@ fn call_vision(args: &Value) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
     let data_url = format!("data:{mime};base64,{b64}");
 
-    let api_key = match std::env::var("OPENCODE_GO_KEY") {
-        Ok(k) => k,
-        Err(_) => return err_msg("OPENCODE_GO_KEY not set"),
-    };
+    match send_vision(&payload, &mime, &prompt, max_tokens) {
+        Ok(s) => {
+            if mode == "locate" {
+                extract_json_array(&s)
+                    .map(|j| convert_bboxes(&j, region_info))
+                    .unwrap_or_else(|| format!("WARNING: model output is not a JSON array, returning raw text:\n{s}"))
+            } else {
+                s
+            }
+        }
+        Err(e) => e,
+    }
+}
+
+/// 发送一张图 + 提示词到视觉模型，返回文本（locate/ocr 等模式共享）。
+fn send_vision(data: &[u8], mime: &str, prompt: &str, max_tokens: u64) -> Result<String, String> {
+    let api_key = std::env::var("OPENCODE_GO_KEY").map_err(|_| err_msg("OPENCODE_GO_KEY not set"))?;
     let model = std::env::var("VISION_MODEL").unwrap_or_else(|_| MODEL.to_string());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    let data_url = format!("data:{mime};base64,{b64}");
 
     let body = json!({
         "model": model,
@@ -198,33 +226,28 @@ fn call_vision(args: &Value) -> String {
                 Ok(v) => v
                     .pointer("/choices/0/message/content")
                     .and_then(|c| c.as_str())
-                    .map(|s| {
-                        if mode == "locate" {
-                            extract_json_array(s)
-                                .map(|j| convert_bboxes(&j, region_info))
-                                .unwrap_or_else(|| format!("WARNING: model output is not a JSON array, returning raw text:\n{s}"))
-                        } else {
-                            s.to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| {
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
                         v.get("error")
                             .map(|e| err_msg(&format!("openrouter error: {e}")))
                             .unwrap_or_else(|| err_msg("no content in response"))
                     }),
-                Err(_) => err_msg(&format!("invalid json from openrouter: {}", truncate(&text, 500))),
+                Err(_) => Err(err_msg(&format!(
+                    "invalid json from openrouter: {}",
+                    truncate(&text, 500)
+                ))),
             }
         }
         Err(e) => match e {
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
-                err_msg(&format!(
+                Err(err_msg(&format!(
                     "openrouter http {code}: {} (hint: {})",
                     truncate(&body, 500),
                     http_hint(code)
-                ))
+                )))
             }
-            other => err_msg(&format!("request failed: {other}")),
+            other => Err(err_msg(&format!("request failed: {other}"))),
         },
     }
 }
@@ -434,6 +457,260 @@ fn pixel_diff(args: &Value) -> String {
         size_note,
         if regions.is_empty() { "  none".to_string() } else { regions.join("\n") }
     )
+}
+
+/// 长截图分块 OCR：高 > 1200px 时自动切成重叠块逐块转录，合并输出。
+const OCR_BLOCK_H: u32 = 1200;
+const OCR_OVERLAP: u32 = 120;
+const OCR_PROMPT: &str = "逐字转录图片中的所有文字，保留原有顺序与分段（说话人、时间戳、引用关系也一并转录）。只输出文字内容本身，不要任何解释。";
+
+fn ocr_image(args: &Value) -> String {
+    let path = match args.get("image").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return err_msg("missing required argument: image"),
+    };
+    let max_tokens = args.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(2048);
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => return err_msg(&format!("cannot read {path}: {e}")),
+    };
+    let img = match image::load_from_memory(&data) {
+        Ok(i) => i,
+        Err(e) => return err_msg(&format!("cannot decode {path}: {e}")),
+    };
+    let blocks = chunk_blocks(img.height());
+    let mut out = Vec::new();
+    for (i, (y, bh)) in blocks.iter().enumerate() {
+        let block = img.crop_imm(0, *y, img.width(), *bh).to_rgba8();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if image::DynamicImage::ImageRgba8(block)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .is_err()
+        {
+            return err_msg("cannot encode block");
+        }
+        match send_vision(&buf.into_inner(), "image/png", OCR_PROMPT, max_tokens) {
+            Ok(t) => out.push(format!("[block {}/{} y:{}..{}]\n{}", i + 1, blocks.len(), y, y + bh, t)),
+            Err(e) => out.push(format!("[block {}/{} ERROR]\n{}", i + 1, blocks.len(), e)),
+        }
+    }
+    let note = if blocks.len() > 1 {
+        format!("共 {} 块，相邻块 {}px 重叠用于衔接；合并时去重边界重复内容。\n\n", blocks.len(), OCR_OVERLAP)
+    } else {
+        String::new()
+    };
+    format!("{note}{}", out.join("\n\n"))
+}
+
+/// 水平分块：每块 OCR_BLOCK_H 高，相邻块重叠 OCR_OVERLAP。
+fn chunk_blocks(h: u32) -> Vec<(u32, u32)> {
+    if h <= OCR_BLOCK_H {
+        return vec![(0, h)];
+    }
+    let mut blocks = Vec::new();
+    let mut y = 0u32;
+    while y < h {
+        let bh = (h - y).min(OCR_BLOCK_H);
+        blocks.push((y, bh));
+        y += OCR_BLOCK_H - OCR_OVERLAP;
+    }
+    blocks
+}
+
+/// 本地矢量拟合：灰度阈值 + Zhang-Suen 中心线细化 + 折线追踪 → SVG。零模型调用。
+fn trace_svg(args: &Value) -> String {
+    let path = match args.get("image").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return err_msg("missing required argument: image"),
+    };
+    let threshold = args.get("threshold").and_then(|v| v.as_u64()).unwrap_or(128) as u8;
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => return err_msg(&format!("cannot read {path}: {e}")),
+    };
+    let img = match image::load_from_memory(&data) {
+        Ok(i) => i,
+        Err(e) => return err_msg(&format!("cannot decode {path}: {e}")),
+    };
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 3 || h < 3 {
+        return err_msg("image too small for tracing");
+    }
+    let gray = img.to_luma8();
+    let mut bin = vec![vec![false; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            bin[y][x] = gray.get_pixel(x as u32, y as u32)[0] < threshold;
+        }
+    }
+    thin_zs(&mut bin, w, h);
+    let paths = trace_paths(&bin, w, h);
+    let mut d = String::new();
+    for p in &paths {
+        if p.len() < 2 {
+            continue;
+        }
+        d.push_str(&format!("M{} {} ", p[0].0, p[0].1));
+        for pt in &p[1..] {
+            d.push_str(&format!("L{} {} ", pt.0, pt.1));
+        }
+    }
+    if d.is_empty() {
+        return "no foreground found (try lower threshold)".to_string();
+    }
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\"><path d=\"{}\" stroke=\"black\" stroke-width=\"1\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>",
+        w,
+        h,
+        w,
+        h,
+        d.trim()
+    )
+}
+
+/// Zhang-Suen 细化：两步子迭代直到收敛。
+fn thin_zs(bin: &mut [Vec<bool>], w: usize, h: usize) {
+    let passes: [bool; 2] = [true, false];
+    loop {
+        let mut changed = false;
+        for first in passes {
+            let mut to_remove: Vec<(usize, usize)> = Vec::new();
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    if !bin[y][x] {
+                        continue;
+                    }
+                    let (p2, p3, p4, p5, p6, p7, p8, p9) = n8(bin, x, y);
+                    let seq = [p2, p3, p4, p5, p6, p7, p8, p9];
+                    let b = seq.iter().filter(|&&v| v).count();
+                    if b < 2 || b > 6 || transitions(&seq) != 1 {
+                        continue;
+                    }
+                    let removable = if first {
+                        !(p2 && p4 && p6) && !(p4 && p6 && p8)
+                    } else {
+                        !(p2 && p4 && p8) && !(p2 && p6 && p8)
+                    };
+                    if removable {
+                        to_remove.push((x, y));
+                    }
+                }
+            }
+            if !to_remove.is_empty() {
+                changed = true;
+                for (x, y) in to_remove {
+                    bin[y][x] = false;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn n8(bin: &[Vec<bool>], x: usize, y: usize) -> (bool, bool, bool, bool, bool, bool, bool, bool) {
+    (
+        bin[y - 1][x],
+        bin[y - 1][x + 1],
+        bin[y][x + 1],
+        bin[y + 1][x + 1],
+        bin[y + 1][x],
+        bin[y + 1][x - 1],
+        bin[y][x - 1],
+        bin[y - 1][x - 1],
+    )
+}
+
+/// 8 邻域 0→1 转变次数。
+fn transitions(seq: &[bool; 8]) -> u32 {
+    let mut n = 0;
+    for i in 0..8 {
+        if !seq[i] && seq[(i + 1) % 8] {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 骨架折线化：从端点/叉点追踪，闭合环兜底。
+fn trace_paths(bin: &[Vec<bool>], w: usize, h: usize) -> Vec<Vec<(u32, u32)>> {
+    let neighbors = |x: usize, y: usize| -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h
+                    && bin[ny as usize][nx as usize]
+                {
+                    v.push((nx as usize, ny as usize));
+                }
+            }
+        }
+        v
+    };
+    let mut visited = vec![vec![false; w]; h];
+    let mut paths: Vec<Vec<(u32, u32)>> = Vec::new();
+    // 第一遍：从端点（≤1 邻居）起步，遇叉点/已访问停
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if bin[y][x] && !visited[y][x] && neighbors(x, y).len() <= 1 {
+                starts.push((x, y));
+            }
+        }
+    }
+    for s in starts {
+        if visited[s.1][s.0] {
+            continue;
+        }
+        let mut path = Vec::new();
+        let (mut cx, mut cy) = s;
+        loop {
+            if visited[cy][cx] {
+                break;
+            }
+            visited[cy][cx] = true;
+            path.push((cx as u32, cy as u32));
+            let nbrs: Vec<_> = neighbors(cx, cy).into_iter().filter(|(x, y)| !visited[*y][*x]).collect();
+            if nbrs.len() != 1 {
+                break;
+            }
+            (cx, cy) = nbrs[0];
+        }
+        if path.len() >= 2 {
+            paths.push(path);
+        }
+    }
+    // 第二遍：闭合环（无端点）兜底
+    for y in 0..h {
+        for x in 0..w {
+            if !bin[y][x] || visited[y][x] {
+                continue;
+            }
+            let mut path = Vec::new();
+            let (mut cx, mut cy) = (x, y);
+            loop {
+                if visited[cy][cx] {
+                    break;
+                }
+                visited[cy][cx] = true;
+                path.push((cx as u32, cy as u32));
+                let nbrs: Vec<_> = neighbors(cx, cy).into_iter().filter(|(x, y)| !visited[*y][*x]).collect();
+                if nbrs.is_empty() {
+                    break;
+                }
+                (cx, cy) = nbrs[0];
+            }
+            if path.len() >= 2 {
+                paths.push(path);
+            }
+        }
+    }
+    paths
 }
 
 /// 本地解析图片尺寸（PNG/GIF/JPEG 头，零依赖），像素层信息不下放给模型。
@@ -666,5 +943,53 @@ mod tests {
         for p in img.pixels_mut() {
             *p = image::Rgba([255u8, 0, 0, 255]);
         }
+    }
+
+    #[test]
+    fn chunk_blocks_single_for_short() {
+        assert_eq!(chunk_blocks(1000), vec![(0, 1000)]);
+    }
+
+    #[test]
+    fn chunk_blocks_overlap_and_cover() {
+        let blocks = chunk_blocks(3000);
+        assert_eq!(blocks, vec![(0, 1200), (1080, 1200), (2160, 840)]);
+        assert_eq!(blocks[0].0 + blocks[0].1, 1200);
+        // 相邻块重叠 = OCR_OVERLAP，且最后一块覆盖到末尾
+        for pair in blocks.windows(2) {
+            assert_eq!(pair[1].0, pair[0].0 + pair[0].1 - OCR_OVERLAP);
+        }
+        let (last_y, last_h) = *blocks.last().unwrap();
+        assert_eq!(last_y + last_h, 3000);
+    }
+
+    #[test]
+    fn transitions_count() {
+        assert_eq!(transitions(&[false, true, true, false, false, false, false, false]), 1);
+        assert_eq!(transitions(&[true, false, true, false, true, false, true, false]), 4);
+    }
+
+    #[test]
+    fn trace_svg_produces_path_for_rect_frame() {
+        // 20x20 空心矩形框（1px 边框，x/y 5..14）
+        let mut img = image::RgbaImage::new(20, 20);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([255u8, 255, 255, 255]);
+        }
+        for i in 5..15 {
+            for &(x, y) in &[(i, 5), (i, 14), (5, i), (14, i)] {
+                img.put_pixel(x, y, image::Rgba([0u8, 0, 0, 255]));
+            }
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let dir = std::env::temp_dir();
+        let p = dir.join("vtrace.png");
+        std::fs::write(&p, buf.into_inner()).unwrap();
+        let out = trace_svg(&json!({"image": p.to_str().unwrap()}));
+        assert!(out.starts_with("<svg"), "{out}");
+        assert!(out.contains("<path d=\"M"), "{out}");
+        assert!(out.contains("viewBox=\"0 0 20 20\""), "{out}");
+        let _ = std::fs::remove_file(&p);
     }
 }
